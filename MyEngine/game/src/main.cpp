@@ -13,12 +13,60 @@
 #include <optional>
 #include <set>
 #include <array>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+
+#define GLM_FORCE_RADIANS
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+
+#include "imgui.h"
+#include "backends/imgui_impl_glfw.h"
+#include "backends/imgui_impl_vulkan.h"
+#include "ImGuizmo.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#include <commdlg.h>
+#endif
+
 const uint32_t WIDTH = 800;
 const uint32_t HEIGHT = 600;
+const int MAX_SPRITE_INSTANCES = 1000;
+
+// Helper: Trim whitespace from std::string
+static inline std::string trim(const std::string& str) {
+    size_t first = str.find_first_not_of(" \t\n\r\f\v");
+    if (std::string::npos == first) return "";
+    size_t last = str.find_last_not_of(" \t\n\r\f\v");
+    return str.substr(first, (last - first + 1));
+}
+
+// Helper: Open File Dialog
+static std::string openFileDialog(const char* filter = "All Files\0*.*\0Image Files\0*.png;*.jpg;*.jpeg\0") {
+#ifdef _WIN32
+    OPENFILENAMEA ofn;
+    CHAR szFile[260] = { 0 };
+    ZeroMemory(&ofn, sizeof(OPENFILENAME));
+    ofn.lStructSize = sizeof(OPENFILENAME);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter = filter;
+    ofn.nFilterIndex = 2;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameA(&ofn) == TRUE) {
+        return std::string(ofn.lpstrFile);
+    }
+#endif
+    return "";
+}
 
 const int MAX_FRAMES_IN_FLIGHT = 2;
 
@@ -67,6 +115,72 @@ struct SwapChainSupportDetails {
     std::vector<VkPresentModeKHR> presentModes;
 };
 
+struct UniformBufferObject {
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
+    alignas(8) glm::vec2 uvOffset;
+    alignas(8) glm::vec2 uvScale;
+    alignas(16) glm::vec4 colorTint;
+    alignas(16) glm::vec4 emissiveColor;
+    alignas(4) float emissiveStrength;
+    alignas(4) float chromaticAberration;
+    alignas(4) float scanlines;
+    alignas(4) float pixelation;
+    alignas(4) float saturation;
+    alignas(4) float waveDistortion;
+    alignas(4) float time;
+};
+
+enum class AnimationMode {
+    SpriteSheetGrid,
+    ImageSequence
+};
+
+struct SpriteInstance {
+    AnimationMode mode = AnimationMode::SpriteSheetGrid;
+    int cols = 2;
+    int rows = 2;
+    int fps = 5;
+    int currentFrame = 0;
+    bool playAnimation = true;
+    char texturePath[256] = "E:/GitHub/Game_Engine_3D/MyEngine/game/textures/texture.jpg";
+
+    // Transform
+    glm::vec2 position = {0.0f, 0.0f};
+    float rotation = 0.0f;
+    glm::vec2 scale = {1.0f, 1.0f};
+    bool flipH = false;
+    bool flipV = false;
+
+    // Material properties
+    glm::vec4 colorTint = {1.0f, 1.0f, 1.0f, 1.0f};
+    glm::vec4 emissiveColor = {1.0f, 0.0f, 0.0f, 1.0f};
+    float emissiveStrength = 0.0f;
+
+    // 2D Effects
+    float chromaticAberration = 0.0f;
+    float scanlines = 0.0f;
+    float pixelation = 0.0f;
+    float saturation = 1.0f;
+    float waveDistortion = 0.0f;
+
+    // Sequence specific
+    char seqBasePath[256] = "E:/GitHub/Game_Engine_3D/MyEngine/game/textures/frame_";
+    char seqExtension[16] = ".jpg";
+    int seqStartIndex = 0;
+    int seqFrameCount = 4;
+    int seqPadding = 3;
+
+    // Instance rendering resources
+    VkImage textureImage = VK_NULL_HANDLE;
+    VkDeviceMemory textureImageMemory = VK_NULL_HANDLE;
+    VkImageView textureImageView = VK_NULL_HANDLE;
+    VkSampler textureSampler = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> descriptorSets;
+};
+
+
 struct Vertex {
     float pos[2];
     float color[3];
@@ -103,9 +217,9 @@ struct Vertex {
 };
 
 const std::vector<Vertex> vertices = {
-    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
-    {{ 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
-    {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f}},
+    {{ 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {1.0f, 0.0f}},
+    {{ 0.5f,  0.5f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}},
     {{-0.5f,  0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
 };
 
@@ -153,14 +267,18 @@ private:
     VkSemaphore renderFinishedSemaphore;
     VkFence inFlightFence;
 
-    VkImage textureImage;
-    VkDeviceMemory textureImageMemory;
-    VkImageView textureImageView;
-    VkSampler textureSampler;
-
     VkDescriptorSetLayout descriptorSetLayout;
     VkDescriptorPool descriptorPool;
-    VkDescriptorSet descriptorSet;
+    VkDescriptorPool imguiPool;
+
+    std::vector<VkBuffer> uniformBuffers;
+    std::vector<VkDeviceMemory> uniformBuffersMemory;
+    std::vector<void*> uniformBuffersMapped;
+
+    // Scene Graph
+    std::vector<SpriteInstance> sceneSprites;
+    int cachedSelectedSprite = 0;
+    size_t dynamicAlignment = 0;
 
     VkBuffer vertexBuffer;
     VkDeviceMemory vertexBufferMemory;
@@ -189,20 +307,288 @@ private:
         createGraphicsPipeline();
         createFramebuffers();
         createCommandPool();
-        createTextureImage();
-        createTextureImageView();
-        createTextureSampler();
+
         createVertexBuffer();
         createIndexBuffer();
+        createUniformBuffers();
         createDescriptorPool();
-        createDescriptorSets();
+
+        // Spawn default initial sprite and build its bounds
+        sceneSprites.push_back(SpriteInstance());
+        initSpriteState(sceneSprites[0]);
+
         createCommandBuffer();
         createSyncObjects();
+        initImGui();
+    }
+
+    void parseSequenceFile(const std::string& filepath, SpriteInstance& sprite) {
+        size_t dot_idx = filepath.find_last_of('.');
+        if (dot_idx == std::string::npos) return;
+
+        std::string ext = filepath.substr(dot_idx);
+        std::string no_ext = filepath.substr(0, dot_idx);
+
+        // Find trailing digits
+        size_t num_end = no_ext.length();
+        size_t num_start = num_end;
+        while (num_start > 0 && std::isdigit(no_ext[num_start - 1])) {
+            num_start--;
+        }
+
+        if (num_start < num_end) {
+            std::string num_str = no_ext.substr(num_start);
+            int padding = static_cast<int>(num_str.length());
+            int start_idx = std::stoi(num_str);
+            std::string base = no_ext.substr(0, num_start);
+
+            // Update UI variables safely
+            strncpy(sprite.seqBasePath, base.c_str(), sizeof(sprite.seqBasePath) - 1);
+            strncpy(sprite.seqExtension, ext.c_str(), sizeof(sprite.seqExtension) - 1);
+            sprite.seqStartIndex = start_idx;
+            sprite.seqPadding = padding;
+        } else {
+            strncpy(sprite.seqBasePath, no_ext.c_str(), sizeof(sprite.seqBasePath) - 1);
+            strncpy(sprite.seqExtension, ext.c_str(), sizeof(sprite.seqExtension) - 1);
+            sprite.seqStartIndex = 0;
+            sprite.seqPadding = 0;
+        }
+    }
+
+    void initImGui() {
+        // Create ImGui Descriptor Pool
+        VkDescriptorPoolSize pool_sizes[] =
+        {
+            { VK_DESCRIPTOR_TYPE_SAMPLER, 1000 },
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000 },
+            { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000 },
+            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1000 },
+            { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1000 },
+            { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1000 },
+            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000 },
+            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000 },
+            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000 },
+            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000 },
+            { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000 }
+        };
+
+        VkDescriptorPoolCreateInfo pool_info = {};
+        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        pool_info.maxSets = 1000;
+        pool_info.poolSizeCount = std::size(pool_sizes);
+        pool_info.pPoolSizes = pool_sizes;
+
+        if (vkCreateDescriptorPool(device, &pool_info, nullptr, &imguiPool) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create imgui descriptor pool!");
+        }
+
+        // Setup Dear ImGui context
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO(); (void)io;
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+        ImGui::StyleColorsDark();
+
+        // Setup Platform/Renderer bindings
+        ImGui_ImplGlfw_InitForVulkan(window, true);
+        ImGui_ImplVulkan_InitInfo init_info = {};
+        init_info.Instance = instance;
+        init_info.PhysicalDevice = physicalDevice;
+        init_info.Device = device;
+        QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+        init_info.QueueFamily = indices.graphicsFamily.value();
+        init_info.Queue = graphicsQueue;
+        init_info.PipelineCache = VK_NULL_HANDLE;
+        init_info.DescriptorPool = imguiPool;
+        init_info.MinImageCount = MAX_FRAMES_IN_FLIGHT;
+        init_info.ImageCount = MAX_FRAMES_IN_FLIGHT;
+        init_info.Allocator = nullptr;
+        init_info.CheckVkResultFn = nullptr;
+
+        init_info.PipelineInfoMain.RenderPass = renderPass; // use existing render pass
+        init_info.PipelineInfoMain.Subpass = 0;
+        init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+
+        ImGui_ImplVulkan_Init(&init_info);
+    }
+
+    void initSpriteState(SpriteInstance& sprite) {
+        createTextureImage("", sprite);
+        createTextureImageView(sprite);
+        createTextureSampler(sprite);
+        createDescriptorSets(sprite);
+        updateTextureDescriptors(sprite);
+    }
+
+    void loadTexture(SpriteInstance& sprite) {
+        vkDeviceWaitIdle(device);
+
+        vkDestroySampler(device, sprite.textureSampler, nullptr);
+        vkDestroyImageView(device, sprite.textureImageView, nullptr);
+        vkDestroyImage(device, sprite.textureImage, nullptr);
+        vkFreeMemory(device, sprite.textureImageMemory, nullptr);
+
+        if (sprite.mode == AnimationMode::ImageSequence) {
+            createTextureImageSequence(sprite.seqBasePath, sprite.seqExtension, sprite.seqStartIndex, sprite.seqFrameCount, sprite.seqPadding, sprite);
+            sprite.cols = sprite.seqFrameCount;
+            sprite.rows = 1;
+        } else {
+            createTextureImage(sprite.texturePath, sprite);
+        }
+
+        createTextureImageView(sprite);
+        createTextureSampler(sprite);
+
+        updateTextureDescriptors(sprite);
     }
 
     void mainLoop() {
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
+
+            ImGui_ImplVulkan_NewFrame();
+            ImGui_ImplGlfw_NewFrame();
+            ImGui::NewFrame();
+
+            ImGui::Begin("Scene Graph");
+            if (ImGui::Button("Add Sprite")) {
+                if (sceneSprites.size() < MAX_SPRITE_INSTANCES) {
+                    sceneSprites.push_back(SpriteInstance());
+                    initSpriteState(sceneSprites.back());
+                    cachedSelectedSprite = sceneSprites.size() - 1;
+                }
+            }
+            ImGui::Separator();
+            for (size_t i = 0; i < sceneSprites.size(); i++) {
+                std::string label = "Sprite " + std::to_string(i);
+                if (ImGui::Selectable(label.c_str(), cachedSelectedSprite == i)) {
+                    cachedSelectedSprite = i;
+                }
+            }
+            ImGui::End();
+
+            ImGui::Begin("Sprite Editor");
+
+            if (!sceneSprites.empty() && cachedSelectedSprite >= 0 && cachedSelectedSprite < sceneSprites.size()) {
+                SpriteInstance& sprite = sceneSprites[cachedSelectedSprite];
+
+                int mode = (int)sprite.mode;
+                if (ImGui::Combo("Mode", &mode, "Sprite Sheet\0Image Sequence\0")) {
+                    sprite.mode = (AnimationMode)mode;
+                }
+                ImGui::Separator();
+
+                if (sprite.mode == AnimationMode::SpriteSheetGrid) {
+                    ImGui::InputText("Texture Path", sprite.texturePath, IM_ARRAYSIZE(sprite.texturePath));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Browse##Single")) {
+                        std::string picked = openFileDialog("Image Files\0*.png;*.jpg;*.jpeg\0All Files\0*.*\0");
+                        if (!picked.empty()) {
+                            strncpy(sprite.texturePath, picked.c_str(), sizeof(sprite.texturePath) - 1);
+                        }
+                    }
+
+                    if (ImGui::Button("Load Texture To GPU Memory Target")) {
+                        loadTexture(sprite);
+                    }
+                } else {
+                    ImGui::InputText("Base Path", sprite.seqBasePath, IM_ARRAYSIZE(sprite.seqBasePath));
+                    ImGui::InputText("Extension", sprite.seqExtension, IM_ARRAYSIZE(sprite.seqExtension));
+                    ImGui::InputInt("Start Index", &sprite.seqStartIndex);
+                    ImGui::InputInt("Frame Count", &sprite.seqFrameCount);
+                    ImGui::InputInt("Index Padding", &sprite.seqPadding);
+
+                    if (ImGui::Button("Browse First Frame...")) {
+                        std::string picked = openFileDialog("Image Files\0*.png;*.jpg;*.jpeg\0All Files\0*.*\0");
+                        if (!picked.empty()) {
+                            parseSequenceFile(picked, sprite);
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Load Texture To GPU Memory Target")) {
+                        loadTexture(sprite);
+                    }
+                }
+                ImGui::Separator();
+
+                ImGui::InputInt("Columns", &sprite.cols);
+                ImGui::InputInt("Rows", &sprite.rows);
+                ImGui::InputInt("FPS", &sprite.fps);
+
+                ImGui::Checkbox("Play Animation", &sprite.playAnimation);
+
+                if (!sprite.playAnimation) {
+                    int totalFrames = sprite.cols * sprite.rows;
+                    ImGui::SliderInt("Current Frame", &sprite.currentFrame, 0, totalFrames > 0 ? totalFrames - 1 : 0);
+                } else {
+                    ImGui::Text("Current Frame: %d", sprite.currentFrame);
+                }
+
+                if (sprite.cols < 1) sprite.cols = 1;
+                if (sprite.rows < 1) sprite.rows = 1;
+                if (sprite.fps < 1) sprite.fps = 1;
+
+                ImGui::Separator();
+                ImGui::Text("2D Transform");
+                ImGui::DragFloat2("Position", &sprite.position.x, 0.01f);
+                ImGui::DragFloat("Rotation", &sprite.rotation, 1.0f, -360.0f, 360.0f);
+                ImGui::DragFloat2("Scale", &sprite.scale.x, 0.01f);
+                ImGui::Checkbox("Flip Horizontally", &sprite.flipH);
+                ImGui::SameLine();
+                ImGui::Checkbox("Flip Vertically", &sprite.flipV);
+
+                ImGui::Separator();
+                ImGui::Text("Material Properties");
+                ImGui::ColorEdit4("Color Tint", &sprite.colorTint.x);
+                ImGui::ColorEdit3("Emissive Color", &sprite.emissiveColor.x);
+                ImGui::SliderFloat("Emissive Glow", &sprite.emissiveStrength, 0.0f, 5.0f);
+
+                ImGui::Separator();
+                ImGui::Text("2D Effects");
+                ImGui::SliderFloat("Chromatic Aberration", &sprite.chromaticAberration, 0.0f, 0.1f);
+                ImGui::SliderFloat("Scanline Intensity", &sprite.scanlines, 0.0f, 1.0f);
+                ImGui::SliderFloat("Pixelation Size", &sprite.pixelation, 0.0f, 128.0f);
+                ImGui::SliderFloat("Saturation", &sprite.saturation, 0.0f, 3.0f);
+                ImGui::SliderFloat("Wave Distortion", &sprite.waveDistortion, 0.0f, 0.1f);
+            }
+
+            ImGui::End();
+
+            // ImGuizmo drawing
+            ImGuizmo::BeginFrame();
+            ImGuiIO& io = ImGui::GetIO();
+            ImGuizmo::SetRect(0, 0, io.DisplaySize.x, io.DisplaySize.y);
+            ImGuizmo::SetOrthographic(true);
+
+            if (!sceneSprites.empty() && cachedSelectedSprite >= 0 && cachedSelectedSprite < sceneSprites.size()) {
+                SpriteInstance& sprite = sceneSprites[cachedSelectedSprite];
+
+                // Compute view/proj equivalent to the ones used inside updateUniformBuffer
+                glm::mat4 view = glm::lookAt(glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+                float aspect = swapChainExtent.width / (float) swapChainExtent.height;
+                glm::mat4 proj = glm::ortho(-aspect, aspect, -1.0f, 1.0f, -1.0f, 1.0f);
+
+                // Construct Model
+                glm::mat4 transform = glm::translate(glm::mat4(1.0f), glm::vec3(sprite.position, 0.0f));
+                transform = glm::rotate(transform, glm::radians(sprite.rotation), glm::vec3(0.0f, 0.0f, 1.0f));
+                transform = glm::scale(transform, glm::vec3(sprite.scale, 1.0f));
+
+                ImGuizmo::Manipulate(glm::value_ptr(view), glm::value_ptr(proj), 
+                                     ImGuizmo::TRANSLATE | ImGuizmo::ROTATE_Z | ImGuizmo::SCALE,
+                                     ImGuizmo::LOCAL, glm::value_ptr(transform));
+
+                if (ImGuizmo::IsUsing()) {
+                    glm::vec3 pos, rot, scale;
+                    ImGuizmo::DecomposeMatrixToComponents(glm::value_ptr(transform), glm::value_ptr(pos), glm::value_ptr(rot), glm::value_ptr(scale));
+                    sprite.position = glm::vec2(pos.x, pos.y);
+                    sprite.rotation = rot.z;
+                    sprite.scale = glm::vec2(scale.x, scale.y);
+                }
+            }
+
+            ImGui::Render();
             drawFrame();
         }
 
@@ -210,16 +596,28 @@ private:
     }
 
     void cleanup() {
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+
+        vkDestroyDescriptorPool(device, imguiPool, nullptr);
+        for (size_t i = 0; i < swapChainImages.size(); i++) {
+            vkDestroyBuffer(device, uniformBuffers[i], nullptr);
+            vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
+        }
+
         vkDestroyBuffer(device, indexBuffer, nullptr);
         vkFreeMemory(device, indexBufferMemory, nullptr);
 
         vkDestroyBuffer(device, vertexBuffer, nullptr);
         vkFreeMemory(device, vertexBufferMemory, nullptr);
 
-        vkDestroySampler(device, textureSampler, nullptr);
-        vkDestroyImageView(device, textureImageView, nullptr);
-        vkDestroyImage(device, textureImage, nullptr);
-        vkFreeMemory(device, textureImageMemory, nullptr);
+        for (auto& sprite : sceneSprites) {
+            vkDestroySampler(device, sprite.textureSampler, nullptr);
+            vkDestroyImageView(device, sprite.textureImageView, nullptr);
+            vkDestroyImage(device, sprite.textureImage, nullptr);
+            vkFreeMemory(device, sprite.textureImageMemory, nullptr);
+        }
 
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
         vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
@@ -341,6 +739,14 @@ private:
 
         if (physicalDevice == VK_NULL_HANDLE) {
             throw std::runtime_error("failed to find a suitable GPU!");
+        }
+
+        VkPhysicalDeviceProperties deviceProps;
+        vkGetPhysicalDeviceProperties(physicalDevice, &deviceProps);
+        size_t minUboAlignment = deviceProps.limits.minUniformBufferOffsetAlignment;
+        dynamicAlignment = sizeof(UniformBufferObject);
+        if (minUboAlignment > 0) {
+            dynamicAlignment = (dynamicAlignment + minUboAlignment - 1) & ~(minUboAlignment - 1);
         }
     }
 
@@ -555,7 +961,7 @@ private:
         rasterizer.rasterizerDiscardEnable = VK_FALSE;
         rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
         rasterizer.lineWidth = 1.0f;
-        rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+        rasterizer.cullMode = VK_CULL_MODE_NONE; // Disable culling temporarily
         rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
         rasterizer.depthBiasEnable = VK_FALSE;
 
@@ -566,7 +972,13 @@ private:
 
         VkPipelineColorBlendAttachmentState colorBlendAttachment{};
         colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        colorBlendAttachment.blendEnable = VK_FALSE;
+        colorBlendAttachment.blendEnable = VK_TRUE;
+        colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+        colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
 
         VkPipelineColorBlendStateCreateInfo colorBlending{};
         colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -658,16 +1070,17 @@ private:
         }
     }
 
-    void createTextureImage() {
+    void createTextureImage(const std::string& path, SpriteInstance& sprite) {
+        std::string trimmedPath = trim(path);
         int texWidth, texHeight, texChannels;
         // Intentionally using a bad path to test the dummy texture fallback
-        stbi_uc* pixels = stbi_load("E:/GitHub/Game_Engine_3D/MyEngine/game/textures/texture.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+        stbi_uc* pixels = stbi_load(trimmedPath.c_str(), &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
         VkDeviceSize imageSize;
         bool isDummy = false;
         stbi_uc dummyPixel[4] = { 255, 0, 255, 255 }; // Magenta pixel
 
         if (!pixels) {
-            std::cerr << "Warning: failed to load texture image! Using dummy texture." << std::endl;
+            std::cerr << "Warning: failed to load texture image (" << path << ")! Reason: " << (stbi_failure_reason() ? stbi_failure_reason() : "Unknown") << "\nUsing dummy texture." << std::endl;
             texWidth = 1;
             texHeight = 1;
             imageSize = 4; // 1 pixel * 4 channels
@@ -677,6 +1090,70 @@ private:
             imageSize = texWidth * texHeight * 4;
         }
 
+        uploadPixelsToTexture(pixels, texWidth, texHeight, imageSize, sprite);
+
+        if (!isDummy) {
+            stbi_image_free(pixels);
+        }
+    }
+
+    void createTextureImageSequence(const std::string& basePath, const std::string& extension, int startIndex, int count, int padding, SpriteInstance& sprite) {
+        if (count <= 0) return;
+
+        std::string trimmedBase = trim(basePath);
+        std::string trimmedExt = trim(extension);
+
+        auto constructPath = [&](int index) {
+            std::ostringstream oss;
+            oss << trimmedBase;
+            if (padding > 0) {
+                oss << std::setw(padding) << std::setfill('0');
+            }
+            oss << index << trimmedExt;
+            return oss.str();
+        };
+
+        int firstWidth, firstHeight, firstChannels;
+        std::string firstPath = constructPath(startIndex);
+        stbi_uc* firstPixels = stbi_load(firstPath.c_str(), &firstWidth, &firstHeight, &firstChannels, STBI_rgb_alpha);
+
+        if (!firstPixels) {
+            std::cerr << "Failed to load first sequence image (" << firstPath << "). Reason: " << (stbi_failure_reason() ? stbi_failure_reason() : "Unknown") << "\nFalling back to dummy block." << std::endl;
+            createTextureImage("", sprite);
+            return;
+        }
+
+        int atlasWidth = firstWidth * count;
+        int atlasHeight = firstHeight;
+        VkDeviceSize imageSize = atlasWidth * atlasHeight * 4;
+        stbi_uc* atlasPixels = new stbi_uc[imageSize];
+        memset(atlasPixels, 0, imageSize);
+
+        // Copy first image
+        for (int y = 0; y < firstHeight; ++y) {
+            memcpy(atlasPixels + (y * atlasWidth * 4), firstPixels + (y * firstWidth * 4), firstWidth * 4);
+        }
+        stbi_image_free(firstPixels);
+
+        // Load rest of sequence
+        for (int i = 1; i < count; i++) {
+            std::string path = constructPath(startIndex + i);
+            int w, h, c;
+            stbi_uc* p = stbi_load(path.c_str(), &w, &h, &c, STBI_rgb_alpha);
+            if (p) {
+                for (int y = 0; y < firstHeight && y < h; ++y) {
+                    int copyWidth = std::min(w, firstWidth);
+                    memcpy(atlasPixels + (y * atlasWidth * 4) + (i * firstWidth * 4), p + (y * w * 4), copyWidth * 4);
+                }
+                stbi_image_free(p);
+            }
+        }
+
+        uploadPixelsToTexture(atlasPixels, atlasWidth, atlasHeight, imageSize, sprite);
+        delete[] atlasPixels;
+    }
+
+    void uploadPixelsToTexture(stbi_uc* pixels, int texWidth, int texHeight, VkDeviceSize imageSize, SpriteInstance& sprite) {
         VkBuffer stagingBuffer;
         VkDeviceMemory stagingBufferMemory;
         createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
@@ -686,24 +1163,20 @@ private:
             memcpy(data, pixels, static_cast<size_t>(imageSize));
         vkUnmapMemory(device, stagingBufferMemory);
 
-        if (!isDummy) {
-            stbi_image_free(pixels);
-        }
+        createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, sprite.textureImage, sprite.textureImageMemory);
 
-        createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
-
-        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        copyBufferToImage(stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
-        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        transitionImageLayout(sprite.textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        copyBufferToImage(stagingBuffer, sprite.textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
+        transitionImageLayout(sprite.textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
         vkDestroyBuffer(device, stagingBuffer, nullptr);
         vkFreeMemory(device, stagingBufferMemory, nullptr);
     }
 
-    void createTextureImageView() {
+    void createTextureImageView(SpriteInstance& sprite) {
         VkImageViewCreateInfo viewInfo{};
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        viewInfo.image = textureImage;
+        viewInfo.image = sprite.textureImage;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
         viewInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -712,12 +1185,12 @@ private:
         viewInfo.subresourceRange.baseArrayLayer = 0;
         viewInfo.subresourceRange.layerCount = 1;
 
-        if (vkCreateImageView(device, &viewInfo, nullptr, &textureImageView) != VK_SUCCESS) {
+        if (vkCreateImageView(device, &viewInfo, nullptr, &sprite.textureImageView) != VK_SUCCESS) {
             throw std::runtime_error("failed to create texture image view!");
         }
     }
 
-    void createTextureSampler() {
+    void createTextureSampler(SpriteInstance& sprite) {
         VkSamplerCreateInfo samplerInfo{};
         samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
         samplerInfo.magFilter = VK_FILTER_LINEAR;
@@ -733,7 +1206,7 @@ private:
         samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
         samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
 
-        if (vkCreateSampler(device, &samplerInfo, nullptr, &textureSampler) != VK_SUCCESS) {
+        if (vkCreateSampler(device, &samplerInfo, nullptr, &sprite.textureSampler) != VK_SUCCESS) {
             throw std::runtime_error("failed to create texture sampler!");
         }
     }
@@ -778,18 +1251,91 @@ private:
         vkFreeMemory(device, stagingBufferMemory, nullptr);
     }
 
+    void createUniformBuffers() {
+        VkDeviceSize bufferSize = dynamicAlignment * MAX_SPRITE_INSTANCES;
+
+        uniformBuffers.resize(swapChainImages.size());
+        uniformBuffersMemory.resize(swapChainImages.size());
+        uniformBuffersMapped.resize(swapChainImages.size());
+
+        for (size_t i = 0; i < swapChainImages.size(); i++) {
+            createBuffer(bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, uniformBuffers[i], uniformBuffersMemory[i]);
+            vkMapMemory(device, uniformBuffersMemory[i], 0, bufferSize, 0, &uniformBuffersMapped[i]);
+        }
+    }
+
+    void updateUniformBuffer(uint32_t currentImage) {
+        static auto startTime = std::chrono::high_resolution_clock::now();
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+
+        // Write each sprite's UBO data sequentially into the dynamically aligned buffer block
+        for (size_t i = 0; i < sceneSprites.size(); i++) {
+            UniformBufferObject ubo{};
+            SpriteInstance& sprite = sceneSprites[i];
+
+            glm::vec2 actualScale = sprite.scale;
+            if (sprite.flipH) actualScale.x *= -1.0f;
+            if (sprite.flipV) actualScale.y *= -1.0f;
+
+            glm::mat4 transform = glm::translate(glm::mat4(1.0f), glm::vec3(sprite.position, 0.0f));
+            transform = glm::rotate(transform, glm::radians(sprite.rotation), glm::vec3(0.0f, 0.0f, 1.0f));
+            transform = glm::scale(transform, glm::vec3(actualScale, 1.0f));
+            ubo.model = transform;
+
+            ubo.view = glm::lookAt(glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+            float aspect = swapChainExtent.width / (float) swapChainExtent.height;
+            ubo.proj = glm::ortho(-aspect, aspect, -1.0f, 1.0f, -1.0f, 1.0f);
+            ubo.proj[1][1] *= -1;
+
+            ubo.colorTint = sprite.colorTint;
+            ubo.emissiveColor = sprite.emissiveColor;
+            ubo.emissiveStrength = sprite.emissiveStrength;
+            ubo.chromaticAberration = sprite.chromaticAberration;
+            ubo.scanlines = sprite.scanlines;
+            ubo.pixelation = sprite.pixelation;
+            ubo.saturation = sprite.saturation;
+            ubo.waveDistortion = sprite.waveDistortion;
+            ubo.time = time;
+
+            int totalFrames = sprite.cols * sprite.rows;
+            if (sprite.playAnimation && totalFrames > 0) {
+                sprite.currentFrame = static_cast<int>(time * sprite.fps) % totalFrames;
+            }
+
+            int col = sprite.currentFrame % sprite.cols;
+            int row = sprite.currentFrame / sprite.cols;
+            if (sprite.cols == 0) sprite.cols = 1;
+            if (sprite.rows == 0) sprite.rows = 1;
+            ubo.uvScale = glm::vec2(1.0f / sprite.cols, 1.0f / sprite.rows);
+            ubo.uvOffset = glm::vec2(col * ubo.uvScale.x, row * ubo.uvScale.y);
+
+            // Copy to exact memory offset according to hardware dynamically aligned boundaries
+            void* destination = reinterpret_cast<char*>(uniformBuffersMapped[currentImage]) + (dynamicAlignment * i);
+            memcpy(destination, &ubo, sizeof(UniformBufferObject));
+        }
+    }
+
     void createDescriptorSetLayout() {
+        VkDescriptorSetLayoutBinding uboLayoutBinding{};
+        uboLayoutBinding.binding = 0;
+        uboLayoutBinding.descriptorCount = 1;
+        uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        uboLayoutBinding.pImmutableSamplers = nullptr;
+        uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
         VkDescriptorSetLayoutBinding samplerLayoutBinding{};
-        samplerLayoutBinding.binding = 0;
+        samplerLayoutBinding.binding = 1;
         samplerLayoutBinding.descriptorCount = 1;
         samplerLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         samplerLayoutBinding.pImmutableSamplers = nullptr;
         samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+        std::array<VkDescriptorSetLayoutBinding, 2> bindings = {uboLayoutBinding, samplerLayoutBinding};
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layoutInfo.bindingCount = 1;
-        layoutInfo.pBindings = &samplerLayoutBinding;
+        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+        layoutInfo.pBindings = bindings.data();
 
         if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
             throw std::runtime_error("failed to create descriptor set layout!");
@@ -797,47 +1343,69 @@ private:
     }
 
     void createDescriptorPool() {
-        VkDescriptorPoolSize poolSize{};
-        poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSize.descriptorCount = 1;
+        std::array<VkDescriptorPoolSize, 2> poolSizes{};
+        poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        poolSizes[0].descriptorCount = static_cast<uint32_t>(swapChainImages.size() * MAX_SPRITE_INSTANCES);
+        poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSizes[1].descriptorCount = static_cast<uint32_t>(swapChainImages.size() * MAX_SPRITE_INSTANCES);
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.poolSizeCount = 1;
-        poolInfo.pPoolSizes = &poolSize;
-        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        poolInfo.pPoolSizes = poolSizes.data();
+        poolInfo.maxSets = static_cast<uint32_t>(swapChainImages.size() * MAX_SPRITE_INSTANCES);
 
         if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
             throw std::runtime_error("failed to create descriptor pool!");
         }
     }
 
-    void createDescriptorSets() {
+    void createDescriptorSets(SpriteInstance& sprite) {
+        std::vector<VkDescriptorSetLayout> layouts(swapChainImages.size(), descriptorSetLayout);
         VkDescriptorSetAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         allocInfo.descriptorPool = descriptorPool;
-        allocInfo.descriptorSetCount = 1;
-        allocInfo.pSetLayouts = &descriptorSetLayout;
+        allocInfo.descriptorSetCount = static_cast<uint32_t>(swapChainImages.size());
+        allocInfo.pSetLayouts = layouts.data();
 
-        if (vkAllocateDescriptorSets(device, &allocInfo, &descriptorSet) != VK_SUCCESS) {
+        sprite.descriptorSets.resize(swapChainImages.size());
+        if (vkAllocateDescriptorSets(device, &allocInfo, sprite.descriptorSets.data()) != VK_SUCCESS) {
             throw std::runtime_error("failed to allocate descriptor sets!");
         }
+    }
 
-        VkDescriptorImageInfo imageInfo{};
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        imageInfo.imageView = textureImageView;
-        imageInfo.sampler = textureSampler;
+    void updateTextureDescriptors(SpriteInstance& sprite) {
+        for (size_t i = 0; i < swapChainImages.size(); i++) {
+            VkDescriptorBufferInfo bufferInfo{};
+            bufferInfo.buffer = uniformBuffers[i];
+            bufferInfo.offset = 0;
+            bufferInfo.range = sizeof(UniformBufferObject); // Bind exactly one UBO range
 
-        VkWriteDescriptorSet descriptorWrite{};
-        descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        descriptorWrite.dstSet = descriptorSet;
-        descriptorWrite.dstBinding = 0;
-        descriptorWrite.dstArrayElement = 0;
-        descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        descriptorWrite.descriptorCount = 1;
-        descriptorWrite.pImageInfo = &imageInfo;
+            VkDescriptorImageInfo imageInfo{};
+            imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfo.imageView = sprite.textureImageView;
+            imageInfo.sampler = sprite.textureSampler;
 
-        vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+            std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
+
+            descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[0].dstSet = sprite.descriptorSets[i];
+            descriptorWrites[0].dstBinding = 0;
+            descriptorWrites[0].dstArrayElement = 0;
+            descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            descriptorWrites[0].descriptorCount = 1;
+            descriptorWrites[0].pBufferInfo = &bufferInfo;
+
+            descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[1].dstSet = sprite.descriptorSets[i];
+            descriptorWrites[1].dstBinding = 1;
+            descriptorWrites[1].dstArrayElement = 0;
+            descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            descriptorWrites[1].descriptorCount = 1;
+            descriptorWrites[1].pImageInfo = &imageInfo;
+
+            vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+        }
     }
 
     void createCommandBuffer() {
@@ -875,8 +1443,6 @@ private:
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
 
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
-
         VkBuffer vertexBuffers[] = {vertexBuffer};
         VkDeviceSize offsets[] = {0};
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
@@ -897,7 +1463,14 @@ private:
         scissor.extent = swapChainExtent;
         vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-        vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+        // Draw multiple instances using dynamic bindings
+        for (size_t i = 0; i < sceneSprites.size(); i++) {
+            uint32_t dynamicOffset = static_cast<uint32_t>(i * dynamicAlignment);
+            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &sceneSprites[i].descriptorSets[imageIndex], 1, &dynamicOffset);
+            vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+        }
+
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commandBuffer);
 
         vkCmdEndRenderPass(commandBuffer);
 
@@ -924,10 +1497,19 @@ private:
 
     void drawFrame() {
         vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
-        vkResetFences(device, 1, &inFlightFence);
 
         uint32_t imageIndex;
-        vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+        VkResult result = vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+
+        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || result == VK_ERROR_SURFACE_LOST_KHR) {
+            return; // Skip this frame rather than reading garbage uninitialized indices
+        } else if (result != VK_SUCCESS) {
+            throw std::runtime_error("failed to acquire swap chain image!");
+        }
+
+        vkResetFences(device, 1, &inFlightFence);
+
+        updateUniformBuffer(imageIndex);
 
         vkResetCommandBuffer(commandBuffer, /*VkCommandBufferResetFlagBits*/ 0);
         recordCommandBuffer(commandBuffer, imageIndex);
