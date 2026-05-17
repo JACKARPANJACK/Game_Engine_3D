@@ -1,6 +1,7 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
-
+#include <vulkan/vulkan.h>
+#include <vulkan/vulkan_core.h>
 #include <iostream>
 #include <fstream>
 #include <stdexcept>
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <filesystem>
 
 #define GLM_FORCE_RADIANS
 #include <glm/glm.hpp>
@@ -134,10 +136,55 @@ struct UniformBufferObject {
 
 enum class AnimationMode {
     SpriteSheetGrid,
-    ImageSequence
+    ImageSequence,
+    StaticImage
 };
 
-struct SpriteInstance {
+// Structural Nodes Layout
+struct Node {
+    std::string name = "Node";
+    Node* parent = nullptr;
+    std::vector<std::unique_ptr<Node>> children;
+
+    Node() = default;
+    virtual ~Node() = default;
+
+    // Explicitly delete copy and default move to fix unique_ptr compilation errors within vectors
+    Node(const Node&) = delete;
+    Node& operator=(const Node&) = delete;
+    Node(Node&&) noexcept = default;
+    Node& operator=(Node&&) noexcept = default;
+
+    void addChild(std::unique_ptr<Node> child) {
+        child->parent = this;
+        children.push_back(std::move(child));
+    }
+};
+
+struct Node2D : public Node {
+    glm::vec2 position = {0.0f, 0.0f};
+    float rotation = 0.0f;
+    glm::vec2 scale = {1.0f, 1.0f};
+
+    glm::mat4 getGlobalTransform() const {
+        glm::mat4 t = glm::translate(glm::mat4(1.0f), glm::vec3(position, 0.0f));
+        t = glm::rotate(t, glm::radians(rotation), glm::vec3(0.0f, 0.0f, 1.0f));
+        t = glm::scale(t, glm::vec3(scale, 1.0f));
+
+        if (parent) {
+            if (auto p2d = dynamic_cast<Node2D*>(parent)) {
+                return p2d->getGlobalTransform() * t;
+            }
+        }
+        return t;
+    }
+};
+
+struct CharacterBody2D : public Node2D {
+    glm::vec2 velocity = {0.0f, 0.0f};
+};
+
+struct AnimatedSprite2D : public Node2D {
     AnimationMode mode = AnimationMode::SpriteSheetGrid;
     int cols = 2;
     int rows = 2;
@@ -146,10 +193,6 @@ struct SpriteInstance {
     bool playAnimation = true;
     char texturePath[256] = "E:/GitHub/Game_Engine_3D/MyEngine/game/textures/texture.jpg";
 
-    // Transform
-    glm::vec2 position = {0.0f, 0.0f};
-    float rotation = 0.0f;
-    glm::vec2 scale = {1.0f, 1.0f};
     bool flipH = false;
     bool flipV = false;
 
@@ -178,13 +221,18 @@ struct SpriteInstance {
     VkImageView textureImageView = VK_NULL_HANDLE;
     VkSampler textureSampler = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> descriptorSets;
+    
+    AnimatedSprite2D() {
+        name = "AnimatedSprite2D";
+    }
 };
-
+// Aliased to keep existing hardware systems intact during gradual rollout
+using SpriteInstance = AnimatedSprite2D;
 
 struct Vertex {
-    float pos[2];
-    float color[3];
-    float texCoord[2];
+    glm::vec2 pos;
+    glm::vec3 color;
+    glm::vec2 texCoord;
 
     static VkVertexInputBindingDescription getBindingDescription() {
         VkVertexInputBindingDescription bindingDescription{};
@@ -342,11 +390,26 @@ private:
             int start_idx = std::stoi(num_str);
             std::string base = no_ext.substr(0, num_start);
 
+            int count = 0;
+            while (true) {
+                std::ostringstream oss;
+                oss << base;
+                if (padding > 0) oss << std::setw(padding) << std::setfill('0');
+                oss << (start_idx + count) << ext;
+
+                if (std::filesystem::exists(oss.str())) {
+                    count++;
+                } else {
+                    break;
+                }
+            }
+
             // Update UI variables safely
             strncpy(sprite.seqBasePath, base.c_str(), sizeof(sprite.seqBasePath) - 1);
             strncpy(sprite.seqExtension, ext.c_str(), sizeof(sprite.seqExtension) - 1);
             sprite.seqStartIndex = start_idx;
             sprite.seqPadding = padding;
+            if (count > 0) sprite.seqFrameCount = count;
         } else {
             strncpy(sprite.seqBasePath, no_ext.c_str(), sizeof(sprite.seqBasePath) - 1);
             strncpy(sprite.seqExtension, ext.c_str(), sizeof(sprite.seqExtension) - 1);
@@ -452,20 +515,22 @@ private:
             ImGui_ImplGlfw_NewFrame();
             ImGui::NewFrame();
 
+            // Replace flat-based SceneGraph Window stringently
             ImGui::Begin("Scene Graph");
             if (ImGui::Button("Add Sprite")) {
                 if (sceneSprites.size() < MAX_SPRITE_INSTANCES) {
                     sceneSprites.push_back(SpriteInstance());
+                    sceneSprites.back().name = "Sprite " + std::to_string(sceneSprites.size() - 1);
                     initSpriteState(sceneSprites.back());
                     cachedSelectedSprite = sceneSprites.size() - 1;
                 }
             }
             ImGui::Separator();
+            
+            int idCounter = 0;
+            // Iterate roots manually for transition (requires full refactor of sceneSprites root vector array moving forward)
             for (size_t i = 0; i < sceneSprites.size(); i++) {
-                std::string label = "Sprite " + std::to_string(i);
-                if (ImGui::Selectable(label.c_str(), cachedSelectedSprite == i)) {
-                    cachedSelectedSprite = i;
-                }
+                drawSceneGraphNode(&sceneSprites[i], idCounter);
             }
             ImGui::End();
 
@@ -475,12 +540,12 @@ private:
                 SpriteInstance& sprite = sceneSprites[cachedSelectedSprite];
 
                 int mode = (int)sprite.mode;
-                if (ImGui::Combo("Mode", &mode, "Sprite Sheet\0Image Sequence\0")) {
+                if (ImGui::Combo("Mode", &mode, "Sprite Sheet\0Image Sequence\0Static Image\0")) {
                     sprite.mode = (AnimationMode)mode;
                 }
                 ImGui::Separator();
 
-                if (sprite.mode == AnimationMode::SpriteSheetGrid) {
+                if (sprite.mode == AnimationMode::SpriteSheetGrid || sprite.mode == AnimationMode::StaticImage) {
                     ImGui::InputText("Texture Path", sprite.texturePath, IM_ARRAYSIZE(sprite.texturePath));
                     ImGui::SameLine();
                     if (ImGui::Button("Browse##Single")) {
@@ -513,22 +578,29 @@ private:
                 }
                 ImGui::Separator();
 
-                ImGui::InputInt("Columns", &sprite.cols);
-                ImGui::InputInt("Rows", &sprite.rows);
-                ImGui::InputInt("FPS", &sprite.fps);
+                if (sprite.mode != AnimationMode::StaticImage) {
+                    ImGui::InputInt("Columns", &sprite.cols);
+                    ImGui::InputInt("Rows", &sprite.rows);
+                    ImGui::InputInt("FPS", &sprite.fps);
 
-                ImGui::Checkbox("Play Animation", &sprite.playAnimation);
+                    ImGui::Checkbox("Play Animation", &sprite.playAnimation);
 
-                if (!sprite.playAnimation) {
-                    int totalFrames = sprite.cols * sprite.rows;
-                    ImGui::SliderInt("Current Frame", &sprite.currentFrame, 0, totalFrames > 0 ? totalFrames - 1 : 0);
+                    if (!sprite.playAnimation) {
+                        int totalFrames = sprite.cols * sprite.rows;
+                        ImGui::SliderInt("Current Frame", &sprite.currentFrame, 0, totalFrames > 0 ? totalFrames - 1 : 0);
+                    } else {
+                        ImGui::Text("Current Frame: %d", sprite.currentFrame);
+                    }
+
+                    if (sprite.cols < 1) sprite.cols = 1;
+                    if (sprite.rows < 1) sprite.rows = 1;
+                    if (sprite.fps < 1) sprite.fps = 1;
                 } else {
-                    ImGui::Text("Current Frame: %d", sprite.currentFrame);
+                    sprite.cols = 1;
+                    sprite.rows = 1;
+                    sprite.currentFrame = 0;
+                    sprite.playAnimation = false;
                 }
-
-                if (sprite.cols < 1) sprite.cols = 1;
-                if (sprite.rows < 1) sprite.rows = 1;
-                if (sprite.fps < 1) sprite.fps = 1;
 
                 ImGui::Separator();
                 ImGui::Text("2D Transform");
@@ -754,7 +826,7 @@ private:
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
 
         std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
-        std::set<uint32_t> uniqueQueueFamilies = {indices.graphicsFamily.value(), indices.presentFamily.value()};
+        std::set<uint32_t> uniqueQueueFamilies = {indices.graphicsFamily.value(), indices.presentFamily.value()} ;
 
         float queuePriority = 1.0f;
         for (uint32_t queueFamily : uniqueQueueFamilies) {
@@ -818,7 +890,7 @@ private:
         createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
-        uint32_t queueFamilyIndices[] = {indices.graphicsFamily.value(), indices.presentFamily.value()};
+        uint32_t queueFamilyIndices[] = {indices.graphicsFamily.value(), indices.presentFamily.value()} ;
 
         if (indices.graphicsFamily != indices.presentFamily) {
             createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
@@ -1274,15 +1346,15 @@ private:
             UniformBufferObject ubo{};
             SpriteInstance& sprite = sceneSprites[i];
 
+            // Modify Model Matrix UBO push block inside updateUniformBuffer
             glm::vec2 actualScale = sprite.scale;
             if (sprite.flipH) actualScale.x *= -1.0f;
             if (sprite.flipV) actualScale.y *= -1.0f;
 
-            glm::mat4 transform = glm::translate(glm::mat4(1.0f), glm::vec3(sprite.position, 0.0f));
-            transform = glm::rotate(transform, glm::radians(sprite.rotation), glm::vec3(0.0f, 0.0f, 1.0f));
-            transform = glm::scale(transform, glm::vec3(actualScale, 1.0f));
-            ubo.model = transform;
-
+            glm::mat4 globalTransform = sprite.getGlobalTransform();
+            
+            // Reapply directional 2d scale flips post-Global Transform processing
+            ubo.model = glm::scale(globalTransform, glm::vec3(sprite.flipH ? -1.0f : 1.0f, sprite.flipV ? -1.0f : 1.0f, 1.0f));
             ubo.view = glm::lookAt(glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
             float aspect = swapChainExtent.width / (float) swapChainExtent.height;
             ubo.proj = glm::ortho(-aspect, aspect, -1.0f, 1.0f, -1.0f, 1.0f);
@@ -1299,8 +1371,10 @@ private:
             ubo.time = time;
 
             int totalFrames = sprite.cols * sprite.rows;
-            if (sprite.playAnimation && totalFrames > 0) {
+            if (sprite.mode != AnimationMode::StaticImage && sprite.playAnimation && totalFrames > 0) {
                 sprite.currentFrame = static_cast<int>(time * sprite.fps) % totalFrames;
+            } else if (sprite.mode == AnimationMode::StaticImage) {
+                sprite.currentFrame = 0;
             }
 
             int col = sprite.currentFrame % sprite.cols;
@@ -1936,6 +2010,34 @@ private:
         std::cerr << "validation layer: " << pCallbackData->pMessage << std::endl;
 
         return VK_FALSE;
+    }
+
+    // Draw recursive logic helper added above mainLoop()
+    void drawSceneGraphNode(Node* node, int& idCounter) {
+        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick | ImGuiTreeNodeFlags_SpanAvailWidth;
+        
+        // Treat as a leaf if it has no children
+        if (node->children.empty()) {
+            flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+        }
+
+        if (cachedSelectedSprite == idCounter) {
+            flags |= ImGuiTreeNodeFlags_Selected;
+        }
+
+        int currentId = idCounter++;
+        bool nodeOpen = ImGui::TreeNodeEx((void*)(intptr_t)currentId, flags, "%s", node->name.c_str());
+
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+            cachedSelectedSprite = currentId;
+        }
+
+        if (nodeOpen && !node->children.empty()) {
+            for (auto& child : node->children) {
+                drawSceneGraphNode(child.get(), idCounter);
+            }
+            ImGui::TreePop();
+        }
     }
 };
 
